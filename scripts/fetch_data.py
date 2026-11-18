@@ -14,6 +14,7 @@ Run it with:  python scripts/fetch_data.py
 from __future__ import annotations
 
 import json
+import re
 import math
 import sys
 from datetime import datetime, timezone
@@ -97,33 +98,98 @@ def estimate_next_week(closes: list[float]) -> dict:
     }
 
 
-def get_news(ticker: yf.Ticker, limit: int = 2) -> list[dict]:
-    """Return up to `limit` recent news articles as {title, url, publisher, date}."""
-    articles = []
-    try:
-        raw = ticker.news or []
-    except Exception:
-        raw = []
-    for item in raw:
-        content = item.get("content", item)  # newer yfinance nests under "content"
-        title = content.get("title")
-        url = (
-            (content.get("canonicalUrl") or {}).get("url")
-            or (content.get("clickThroughUrl") or {}).get("url")
-            or content.get("link")
-        )
-        publisher = (content.get("provider") or {}).get("displayName") or content.get("publisher")
-        if title and url:
-            articles.append({
-                "title": title,
-                "url": url,
-                "publisher": publisher or "Unknown",
-                "date": content.get("pubDate") or content.get("displayTime"),
-                "summary": (content.get("summary") or "")[:300],
-            })
-        if len(articles) >= limit:
+# Extra names people use in headlines that the official name doesn't contain.
+ALIASES = {
+    "GOOGL": ["Google", "Alphabet"],
+    "META": ["Meta", "Facebook", "Instagram"],
+    "TSM": ["TSMC", "Taiwan Semiconductor"],
+    "LLY": ["Lilly"],
+    "BRK-B": ["Berkshire"],
+    "PG": ["P&G", "Procter"],
+    "JPM": ["JPMorgan"],
+    "UNH": ["UnitedHealth"],
+    "TSLA": ["Tesla"],
+    "AVGO": ["Broadcom"],
+}
+# Endings to strip so "Apple Inc." -> "Apple", "NVIDIA Corporation" -> "NVIDIA".
+NAME_SUFFIXES = re.compile(
+    r"[,.]?\s+(inc|corp|corporation|company|co|ltd|limited|plc|holdings|group|"
+    r"platforms|incorporated|manufacturing company)\.?$", re.IGNORECASE)
+
+
+def company_keywords(symbol: str, name: str) -> list[str]:
+    """Words that show an article is really about this company."""
+    short = re.sub(r"^the\s+", "", name, flags=re.IGNORECASE)
+    while True:  # strip suffixes repeatedly ("Meta Platforms, Inc." -> "Meta")
+        trimmed = NAME_SUFFIXES.sub("", short).strip()
+        trimmed = re.sub(r"\s+(and|&)$", "", trimmed)  # "Eli Lilly and" -> "Eli Lilly"
+        if trimmed == short:
             break
-    return articles
+        short = trimmed
+    # Short company name first: get_news uses it as the search query.
+    words = [short, symbol.split("-")[0], *ALIASES.get(symbol, [])]
+    return list(dict.fromkeys(w for w in words if len(w) >= 2))  # drop duplicates, keep order
+
+
+def mentions(text: str, keywords: list[str]) -> bool:
+    """True if any keyword appears as a whole word (case-insensitive)."""
+    return any(re.search(r"(?<!\w)" + re.escape(k) + r"(?!\w)", text, re.IGNORECASE)
+               for k in keywords)
+
+
+def parse_article(item: dict) -> dict | None:
+    content = item.get("content", item)  # newer yfinance nests under "content"
+    title = content.get("title")
+    url = (
+        (content.get("canonicalUrl") or {}).get("url")
+        or (content.get("clickThroughUrl") or {}).get("url")
+        or content.get("link")
+    )
+    if not (title and url):
+        return None
+    date = content.get("pubDate") or content.get("displayTime")
+    if not date and content.get("providerPublishTime"):
+        date = datetime.fromtimestamp(content["providerPublishTime"], timezone.utc).isoformat()
+    return {
+        "title": title,
+        "url": url,
+        "publisher": (content.get("provider") or {}).get("displayName")
+                     or content.get("publisher") or "Unknown",
+        "date": date,
+        "summary": (content.get("summary") or "")[:300],
+    }
+
+
+def get_news(ticker: yf.Ticker, symbol: str, name: str, limit: int = 2) -> list[dict]:
+    """Return up to `limit` recent articles that actually mention the company.
+
+    Yahoo's news feed for a ticker often includes general market stories, so we
+    pull ~30 articles and keep only ones naming the company. Headline mentions
+    rank above summary-only mentions. If that isn't enough, we also try a
+    Yahoo news search for the company name (filtered the same way).
+    """
+    keywords = company_keywords(symbol, name)
+    raw = []
+    try:
+        raw += ticker.get_news(count=30) or []
+    except Exception:
+        pass
+    try:
+        raw += yf.Search(keywords[0] if keywords else symbol, news_count=10).news or []
+    except Exception:
+        pass
+
+    in_title, in_summary, seen = [], [], set()
+    for item in raw:
+        art = parse_article(item)
+        if not art or art["url"] in seen:
+            continue
+        seen.add(art["url"])
+        if mentions(art["title"], keywords):
+            in_title.append(art)
+        elif mentions(art["summary"], keywords):
+            in_summary.append(art)
+    return (in_title + in_summary)[:limit]
 
 
 def build_stock(symbol: str, ticker: yf.Ticker, history) -> dict:
@@ -176,7 +242,7 @@ def build_stock(symbol: str, ticker: yf.Ticker, history) -> dict:
             "summary": (info.get("longBusinessSummary") or "")[:600],
         },
         "prediction": estimate_next_week(closes),
-        "sources": get_news(ticker),
+        "sources": get_news(ticker, symbol, info.get("longName") or info.get("shortName") or symbol),
         "quote_url": f"https://finance.yahoo.com/quote/{symbol}",
     }
 
